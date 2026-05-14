@@ -1498,6 +1498,185 @@ def format_match_report(
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────
+# Генерация платёжных ссылок
+# ─────────────────────────────────────────────
+
+# Поддерживаемые страны и валюты
+COUNTRY_CURRENCY: dict[str, dict] = {
+    "US": {"name": "США", "currency": "USD"},
+    "GB": {"name": "Великобритания", "currency": "GBP"},
+    "CA": {"name": "Канада", "currency": "CAD"},
+    "DE": {"name": "Германия", "currency": "EUR"},
+    "FR": {"name": "Франция", "currency": "EUR"},
+    "IT": {"name": "Италия", "currency": "EUR"},
+    "ES": {"name": "Испания", "currency": "EUR"},
+    "NL": {"name": "Нидерланды", "currency": "EUR"},
+    "AU": {"name": "Австралия", "currency": "AUD"},
+    "JP": {"name": "Япония", "currency": "JPY"},
+    "SG": {"name": "Сингапур", "currency": "SGD"},
+    "BR": {"name": "Бразилия", "currency": "BRL"},
+    "MX": {"name": "Мексика", "currency": "MXN"},
+    "CH": {"name": "Швейцария", "currency": "CHF"},
+    "SE": {"name": "Швеция", "currency": "SEK"},
+    "NO": {"name": "Норвегия", "currency": "NOK"},
+    "DK": {"name": "Дания", "currency": "DKK"},
+    "PL": {"name": "Польша", "currency": "PLN"},
+    "NZ": {"name": "Новая Зеландия", "currency": "NZD"},
+    "KR": {"name": "Южная Корея", "currency": "KRW"},
+    "IN": {"name": "Индия", "currency": "INR"},
+    "TR": {"name": "Турция", "currency": "TRY"},
+    "AE": {"name": "ОАЭ", "currency": "AED"},
+    "SA": {"name": "Саудовская Аравия", "currency": "SAR"},
+    "IL": {"name": "Израиль", "currency": "ILS"},
+    "ZA": {"name": "ЮАР", "currency": "ZAR"},
+}
+
+
+@dataclass
+class LinkResult:
+    """Результат генерации платёжной ссылки."""
+    service: str
+    country: str
+    currency: str
+    promo: str = ""
+    checkout_url: str = ""
+    checkout_session_id: str = ""
+    error: str = ""
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if v}
+
+
+def generate_chatgpt_link(
+    token: str,
+    *,
+    country: str = "GB",
+    currency: str = "GBP",
+    promo: str = "",
+    plan: str = "chatgptteamplan",
+    seats: int = 2,
+    interval: str = "month",
+    workspace: str = "workspace",
+    timeout: float = 20.0,
+) -> LinkResult:
+    """Генерирует Stripe Checkout ссылку для ChatGPT Team/Business.
+
+    Вызывает /backend-api/payments/checkout с заданными параметрами.
+    """
+    result = LinkResult(
+        service="ChatGPT Team",
+        country=country,
+        currency=currency,
+        promo=promo,
+    )
+
+    payload: dict = {
+        "plan_name": plan,
+        "team_plan_data": {
+            "workspace_name": workspace,
+            "price_interval": interval,
+            "seat_quantity": seats,
+        },
+        "billing_details": {
+            "country": country,
+            "currency": currency,
+        },
+        "checkout_ui_mode": "hosted",
+        "cancel_url": "https://chatgpt.com/",
+    }
+    if promo:
+        payload["promo_code"] = promo
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(
+                "https://chatgpt.com/backend-api/payments/checkout",
+                json=payload,
+                headers=headers,
+            )
+
+            try:
+                data = resp.json()
+            except Exception:
+                result.error = (
+                    f"HTTP {resp.status_code}: "
+                    f"Ответ не JSON ({resp.text[:200]})"
+                )
+                return result
+
+            if not resp.is_success:
+                detail = data.get("detail", json.dumps(data))
+                result.error = f"HTTP {resp.status_code}: {detail}"
+                return result
+
+            url = (
+                data.get("url")
+                or data.get("stripe_hosted_url")
+                or data.get("checkout_url")
+            )
+            session_id = data.get("checkout_session_id", "")
+
+            if not url and session_id:
+                url = (
+                    "https://chatgpt.com/checkout/openai_llc/"
+                    f"{session_id}"
+                )
+
+            if url:
+                result.checkout_url = url
+                result.checkout_session_id = session_id
+            else:
+                result.error = (
+                    "URL не найден в ответе. "
+                    f"Ответ: {json.dumps(data, ensure_ascii=False)}"
+                )
+    except httpx.HTTPError as exc:
+        result.error = f"Сетевая ошибка: {exc}"
+
+    return result
+
+
+def format_link_report(link: LinkResult) -> str:
+    """Форматирует отчёт о сгенерированной ссылке."""
+    hr = "═" * 60
+    lines = [hr]
+    lines.append("  ГЕНЕРАЦИЯ ПЛАТЁЖНОЙ ССЫЛКИ")
+    lines.append(hr)
+
+    cc_info = COUNTRY_CURRENCY.get(link.country, {})
+    country_name = cc_info.get("name", link.country)
+
+    lines.append(f"  Сервис     : {link.service}")
+    lines.append(f"  Страна     : {country_name} ({link.country})")
+    lines.append(f"  Валюта     : {link.currency}")
+    if link.promo:
+        lines.append(f"  Промокод   : {link.promo}")
+
+    lines.append("")
+
+    if link.error:
+        lines.append(f"  ОШИБКА: {link.error}")
+    else:
+        lines.append("  ССЫЛКА СОЗДАНА:")
+        lines.append(f"  {link.checkout_url}")
+        if link.checkout_session_id:
+            lines.append(f"\n  Session ID: {link.checkout_session_id}")
+
+    lines.append(hr)
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -1530,7 +1709,163 @@ def main() -> None:
         help=("URL платёжной страницы для автоподбора карт. "
               "Используется вместе с --batch или stdin."),
     )
+    parser.add_argument(
+        "--generate", type=str, default=None,
+        metavar="SERVICE",
+        help=("Генерация Stripe Checkout ссылки. "
+              "Поддерживается: chatgpt. "
+              "Требует --token."),
+    )
+    parser.add_argument(
+        "--countries", action="store_true",
+        help="Показать список поддерживаемых стран и валют",
+    )
+    parser.add_argument(
+        "--token", type=str, default=None,
+        help="Access-токен для API (например ChatGPT accessToken)",
+    )
+    parser.add_argument(
+        "--country", type=str, default="GB",
+        help="Страна для биллинга (ISO 2-letter, по умолчанию GB)",
+    )
+    parser.add_argument(
+        "--currency", type=str, default=None,
+        help="Валюта (например GBP, EUR, USD). Автоопределение по стране.",
+    )
+    parser.add_argument(
+        "--promo", type=str, default="",
+        help="Промокод для подписки",
+    )
+    parser.add_argument(
+        "--seats", type=int, default=2,
+        help="Количество мест (для ChatGPT Team, по умолчанию 2)",
+    )
+    parser.add_argument(
+        "--plan", type=str, default="chatgptteamplan",
+        help="План подписки (по умолчанию chatgptteamplan)",
+    )
+    parser.add_argument(
+        "--interval", type=str, default="month",
+        choices=["month", "year"],
+        help="Интервал оплаты (month/year, по умолчанию month)",
+    )
+    parser.add_argument(
+        "--workspace", type=str, default="workspace",
+        help="Название workspace (для ChatGPT Team)",
+    )
     args = parser.parse_args()
+
+    # ── Список стран ──
+    if args.countries:
+        print("\nПоддерживаемые страны и валюты:\n")
+        print(f"  {'Код':<6}{'Страна':<25}{'Валюта':<8}{'Tier-1'}")
+        print("  " + "─" * 50)
+        for code, info in sorted(COUNTRY_CURRENCY.items()):
+            tier = "★" if code in TIER1_COUNTRIES else ""
+            print(
+                f"  {code:<6}{info['name']:<25}"
+                f"{info['currency']:<8}{tier}")
+        print(f"\n  Всего: {len(COUNTRY_CURRENCY)} стран")
+        print("  ★ = Tier-1 (низкий риск, приоритет)")
+        sys.exit(0)
+
+    # ── Generate-режим: генерация платёжных ссылок ──
+    if args.generate:
+        service = args.generate.lower()
+        if service not in ("chatgpt", "chatgpt-team"):
+            print(
+                f"Неизвестный сервис: {args.generate}. "
+                "Поддерживается: chatgpt",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if not args.token:
+            print(
+                "Для --generate требуется --token "
+                "(ChatGPT accessToken).\n\n"
+                "Как получить токен:\n"
+                "  1. Откройте https://chatgpt.com\n"
+                "  2. Войдите в аккаунт\n"
+                "  3. F12 → Console → выполните:\n"
+                '     fetch("/api/auth/session")'
+                ".then(r=>r.json())"
+                ".then(d=>console.log(d.accessToken))\n"
+                "  4. Скопируйте токен",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        country = args.country.upper()
+        currency = args.currency
+        if not currency:
+            cc_info = COUNTRY_CURRENCY.get(country, {})
+            currency = cc_info.get("currency", "USD")
+        currency = currency.upper()
+
+        print(f"\nГенерация ссылки: {service} "
+              f"/ {country} / {currency}"
+              f"{' / promo: ' + args.promo if args.promo else ''}...")
+
+        link = generate_chatgpt_link(
+            args.token,
+            country=country,
+            currency=currency,
+            promo=args.promo,
+            plan=args.plan,
+            seats=args.seats,
+            interval=args.interval,
+            workspace=args.workspace,
+            timeout=args.timeout,
+        )
+
+        if args.json_output:
+            output: dict = {"link": link.to_dict()}
+        else:
+            print(format_link_report(link))
+
+        if link.error:
+            if args.json_output:
+                print(json.dumps(output, ensure_ascii=False, indent=2))
+            sys.exit(1)
+
+        # Auto-analyse the generated URL
+        print("\nАнализ сгенерированной ссылки...")
+        site = analyse(link.checkout_url, timeout=args.timeout)
+        if args.json_output:
+            output["analysis"] = site.to_dict()
+        else:
+            print(format_report(site))
+
+        # Auto-match cards if provided
+        card_lines_gen: list[str] = []
+        if args.batch:
+            try:
+                with open(args.batch) as f:
+                    card_lines_gen = [
+                        ln.strip() for ln in f if ln.strip()
+                    ]
+            except FileNotFoundError:
+                print(f"Файл не найден: {args.batch}",
+                      file=sys.stderr)
+        elif args.target:
+            card_lines_gen = [args.target]
+
+        if card_lines_gen:
+            print("\nПодбор карт...")
+            _, matches = match_cards(
+                link.checkout_url, card_lines_gen,
+                timeout=args.timeout,
+            )
+            if args.json_output:
+                output["matches"] = [m.to_dict() for m in matches]
+            else:
+                print(format_match_report(site, matches))
+
+        if args.json_output:
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+
+        sys.exit(0)
 
     # ── Match-режим: автоподбор карт ──
     if args.match:
