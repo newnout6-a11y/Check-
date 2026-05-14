@@ -84,6 +84,43 @@ python bin_checker.py example.com --timeout 30
 ────────────────────────────────────────────────────────
 ```
 
+### 5. Генерация Stripe Checkout ссылок
+
+Автоматическая генерация платёжных ссылок для сервисов:
+
+#### ChatGPT Team
+```bash
+# Генерация ссылки с промокодом для GB/GBP
+python bin_checker.py --generate chatgpt \
+  --token <accessToken> \
+  --country GB --promo codestonegb
+
+# С автоподбором карт
+python bin_checker.py --generate chatgpt \
+  --token <accessToken> \
+  --country GB --batch cards.txt
+```
+
+#### SuperGrok (Grok / xAI)
+```bash
+# Генерация ссылки SuperGrok
+python bin_checker.py --generate grok \
+  --token <sso_cookie> \
+  --plan supergrok --interval month
+
+# SuperGrok Lite
+python bin_checker.py --generate grok \
+  --token <sso_cookie> \
+  --plan supergrok_lite
+
+# JS-скрипт для консоли браузера (альтернатива)
+python bin_checker.py --generate grok --script
+```
+
+**Как получить токен:**
+- **ChatGPT**: F12 → Console → `fetch("/api/auth/session").then(r=>r.json()).then(d=>console.log(d.accessToken))`
+- **Grok**: F12 → Application → Cookies → grok.com → скопировать значение `sso`
+
 ## Зависимости
 
 - Python 3.10+

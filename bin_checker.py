@@ -1647,6 +1647,240 @@ def generate_chatgpt_link(
     return result
 
 
+def generate_grok_link(
+    token: str,
+    *,
+    plan: str = "supergrok",
+    interval: str = "month",
+    timeout: float = 20.0,
+) -> LinkResult:
+    """Генерирует Stripe Checkout ссылку для SuperGrok.
+
+    Использует SSO cookie для аутентификации и вызывает
+    API grok.com для создания checkout-сессии.
+    """
+    plan_names = {
+        "supergrok": "SuperGrok",
+        "supergrok_lite": "SuperGrok Lite",
+        "supergrok-lite": "SuperGrok Lite",
+        "lite": "SuperGrok Lite",
+    }
+    plan_label = plan_names.get(plan.lower(), plan)
+
+    result = LinkResult(
+        service=plan_label,
+        country="",
+        currency="USD",
+    )
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Origin": "https://grok.com",
+        "Referer": "https://grok.com/plans",
+    }
+
+    # SSO cookie or Bearer token
+    is_cookie = not token.startswith("eyJ")
+    if is_cookie:
+        cookie_val = token.removeprefix("sso=")
+        headers["Cookie"] = f"sso={cookie_val}"
+    else:
+        headers["Authorization"] = f"Bearer {token}"
+
+    # Grok checkout endpoints to try
+    endpoints = [
+        {
+            "url": "https://grok.com/rest/app-subscription/create-checkout-session",
+            "payload": {
+                "plan": plan.lower(),
+                "interval": interval,
+            },
+        },
+        {
+            "url": "https://grok.com/rest/billing/checkout",
+            "payload": {
+                "plan_name": plan.lower(),
+                "price_interval": interval,
+            },
+        },
+        {
+            "url": "https://grok.com/api/subscription/checkout",
+            "payload": {
+                "plan": plan.lower(),
+                "interval": interval,
+            },
+        },
+    ]
+
+    try:
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+        ) as client:
+            last_error = ""
+            for ep in endpoints:
+                try:
+                    resp = client.post(
+                        ep["url"],
+                        json=ep["payload"],
+                        headers=headers,
+                    )
+
+                    # Skip if redirect to login
+                    if "accounts.x.ai" in str(resp.url):
+                        last_error = (
+                            "Перенаправлено на логин — "
+                            "SSO cookie невалиден"
+                        )
+                        continue
+
+                    if resp.status_code == 404:
+                        last_error = (
+                            f"{ep['url']} → 404 Not Found"
+                        )
+                        continue
+
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        # HTML response (likely Cloudflare/auth)
+                        if resp.status_code in (401, 403):
+                            last_error = (
+                                f"HTTP {resp.status_code}: "
+                                "требуется авторизация"
+                            )
+                            continue
+                        last_error = (
+                            f"HTTP {resp.status_code}: "
+                            f"не JSON ({resp.text[:150]})"
+                        )
+                        continue
+
+                    if not resp.is_success:
+                        detail = data.get(
+                            "detail",
+                            data.get("error", json.dumps(data)),
+                        )
+                        last_error = (
+                            f"HTTP {resp.status_code}: {detail}"
+                        )
+                        continue
+
+                    # Extract checkout URL
+                    url = (
+                        data.get("url")
+                        or data.get("checkout_url")
+                        or data.get("stripe_url")
+                        or data.get("redirect_url")
+                    )
+                    session_id = (
+                        data.get("checkout_session_id")
+                        or data.get("session_id")
+                        or ""
+                    )
+
+                    if url:
+                        result.checkout_url = url
+                        result.checkout_session_id = session_id
+                        return result
+
+                    last_error = (
+                        "URL не найден в ответе. "
+                        f"Ответ: {json.dumps(data, ensure_ascii=False)}"
+                    )
+
+                except httpx.HTTPError as exc:
+                    last_error = f"Сетевая ошибка: {exc}"
+                    continue
+
+            # None of the endpoints worked — provide console script
+            result.error = (
+                f"Автоматическая генерация не удалась: {last_error}\n\n"
+                "  Используйте консольный скрипт (F12 → Console на grok.com):\n"
+                f"  python bin_checker.py --generate grok --script"
+            )
+
+    except httpx.HTTPError as exc:
+        result.error = f"Сетевая ошибка: {exc}"
+
+    return result
+
+
+def generate_grok_console_script(
+    plan: str = "supergrok",
+    interval: str = "month",
+) -> str:
+    """Генерирует JS-скрипт для вставки в консоль браузера на grok.com."""
+    return f"""
+// SuperGrok Checkout Link Generator
+// Вставьте этот скрипт в консоль браузера (F12) на grok.com
+// Вы должны быть авторизованы на grok.com
+
+(async function generateGrokLink() {{
+  console.log("⏳ Создание checkout сессии...");
+
+  // Попробуем несколько эндпоинтов
+  const endpoints = [
+    {{
+      url: "/rest/app-subscription/create-checkout-session",
+      body: {{ plan: "{plan}", interval: "{interval}" }}
+    }},
+    {{
+      url: "/rest/billing/checkout",
+      body: {{ plan_name: "{plan}", price_interval: "{interval}" }}
+    }},
+    {{
+      url: "/api/subscription/checkout",
+      body: {{ plan: "{plan}", interval: "{interval}" }}
+    }}
+  ];
+
+  for (const ep of endpoints) {{
+    try {{
+      const resp = await fetch(ep.url, {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(ep.body)
+      }});
+
+      if (resp.status === 404) continue;
+
+      const data = await resp.json();
+      const url = data?.url || data?.checkout_url || data?.stripe_url || data?.redirect_url;
+
+      if (url) {{
+        console.log("─".repeat(60));
+        console.log("✅ {plan.replace('"', '')} Checkout Link:");
+        console.log("🔗", url);
+        if (data?.checkout_session_id || data?.session_id)
+          console.log("📋 Session:", data?.checkout_session_id || data?.session_id);
+        console.log("─".repeat(60));
+        return;
+      }}
+
+      console.log(`Endpoint ${{ep.url}}: URL не найден`, data);
+    }} catch(e) {{
+      console.log(`Endpoint ${{ep.url}}: ошибка`, e.message);
+    }}
+  }}
+
+  // Fallback: прямой редирект через Stripe Customer Portal
+  console.log("─".repeat(60));
+  console.log("⚠️ Прямой API не найден.");
+  console.log("📌 Stripe Customer Portal:");
+  console.log("   https://billing.stripe.com/p/login/eVa4iNeNQ3kla9W6oo");
+  console.log("📌 Или перейдите на: https://grok.com/plans");
+  console.log("─".repeat(60));
+}})();
+"""
+
+
 def format_link_report(link: LinkResult) -> str:
     """Форматирует отчёт о сгенерированной ссылке."""
     hr = "═" * 60
@@ -1713,8 +1947,12 @@ def main() -> None:
         "--generate", type=str, default=None,
         metavar="SERVICE",
         help=("Генерация Stripe Checkout ссылки. "
-              "Поддерживается: chatgpt. "
+              "Поддерживается: chatgpt, grok. "
               "Требует --token."),
+    )
+    parser.add_argument(
+        "--script", action="store_true",
+        help="Вывести JS-скрипт для консоли браузера (для grok)",
     )
     parser.add_argument(
         "--countries", action="store_true",
@@ -1722,7 +1960,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--token", type=str, default=None,
-        help="Access-токен для API (например ChatGPT accessToken)",
+        help=("Access-токен для API. "
+              "ChatGPT: accessToken. "
+              "Grok: SSO cookie из grok.com"),
     )
     parser.add_argument(
         "--country", type=str, default="GB",
@@ -1741,8 +1981,10 @@ def main() -> None:
         help="Количество мест (для ChatGPT Team, по умолчанию 2)",
     )
     parser.add_argument(
-        "--plan", type=str, default="chatgptteamplan",
-        help="План подписки (по умолчанию chatgptteamplan)",
+        "--plan", type=str, default=None,
+        help=("План подписки "
+              "(chatgpt: chatgptteamplan, "
+              "grok: supergrok / supergrok_lite)"),
     )
     parser.add_argument(
         "--interval", type=str, default="month",
@@ -1772,52 +2014,89 @@ def main() -> None:
     # ── Generate-режим: генерация платёжных ссылок ──
     if args.generate:
         service = args.generate.lower()
-        if service not in ("chatgpt", "chatgpt-team"):
+        supported = ("chatgpt", "chatgpt-team", "grok", "supergrok")
+        if service not in supported:
             print(
                 f"Неизвестный сервис: {args.generate}. "
-                "Поддерживается: chatgpt",
+                f"Поддерживается: {', '.join(supported)}",
                 file=sys.stderr,
             )
             sys.exit(1)
+
+        is_grok = service in ("grok", "supergrok")
+
+        # --script mode: output console JS and exit
+        if is_grok and args.script:
+            plan = args.plan or "supergrok"
+            print(generate_grok_console_script(
+                plan=plan, interval=args.interval,
+            ))
+            sys.exit(0)
 
         if not args.token:
-            print(
-                "Для --generate требуется --token "
-                "(ChatGPT accessToken).\n\n"
-                "Как получить токен:\n"
-                "  1. Откройте https://chatgpt.com\n"
-                "  2. Войдите в аккаунт\n"
-                "  3. F12 → Console → выполните:\n"
-                '     fetch("/api/auth/session")'
-                ".then(r=>r.json())"
-                ".then(d=>console.log(d.accessToken))\n"
-                "  4. Скопируйте токен",
-                file=sys.stderr,
-            )
+            if is_grok:
+                print(
+                    "Для --generate grok требуется --token "
+                    "(SSO cookie из grok.com).\n\n"
+                    "Как получить SSO cookie:\n"
+                    "  1. Откройте https://grok.com и войдите\n"
+                    "  2. F12 → Application → Cookies → grok.com\n"
+                    "  3. Скопируйте значение cookie 'sso'\n\n"
+                    "Альтернатива — JS-скрипт для консоли:\n"
+                    "  python bin_checker.py --generate grok --script",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "Для --generate требуется --token "
+                    "(ChatGPT accessToken).\n\n"
+                    "Как получить токен:\n"
+                    "  1. Откройте https://chatgpt.com\n"
+                    "  2. Войдите в аккаунт\n"
+                    "  3. F12 → Console → выполните:\n"
+                    '     fetch("/api/auth/session")'
+                    ".then(r=>r.json())"
+                    ".then(d=>console.log(d.accessToken))\n"
+                    "  4. Скопируйте токен",
+                    file=sys.stderr,
+                )
             sys.exit(1)
 
-        country = args.country.upper()
-        currency = args.currency
-        if not currency:
-            cc_info = COUNTRY_CURRENCY.get(country, {})
-            currency = cc_info.get("currency", "USD")
-        currency = currency.upper()
+        if is_grok:
+            plan = args.plan or "supergrok"
+            print(f"\nГенерация ссылки: {service} "
+                  f"/ план: {plan} / {args.interval}...")
 
-        print(f"\nГенерация ссылки: {service} "
-              f"/ {country} / {currency}"
-              f"{' / promo: ' + args.promo if args.promo else ''}...")
+            link = generate_grok_link(
+                args.token,
+                plan=plan,
+                interval=args.interval,
+                timeout=args.timeout,
+            )
+        else:
+            plan = args.plan or "chatgptteamplan"
+            country = args.country.upper()
+            currency = args.currency
+            if not currency:
+                cc_info = COUNTRY_CURRENCY.get(country, {})
+                currency = cc_info.get("currency", "USD")
+            currency = currency.upper()
 
-        link = generate_chatgpt_link(
-            args.token,
-            country=country,
-            currency=currency,
-            promo=args.promo,
-            plan=args.plan,
-            seats=args.seats,
-            interval=args.interval,
-            workspace=args.workspace,
-            timeout=args.timeout,
-        )
+            print(f"\nГенерация ссылки: {service} "
+                  f"/ {country} / {currency}"
+                  f"{' / promo: ' + args.promo if args.promo else ''}...")
+
+            link = generate_chatgpt_link(
+                args.token,
+                country=country,
+                currency=currency,
+                promo=args.promo,
+                plan=plan,
+                seats=args.seats,
+                interval=args.interval,
+                workspace=args.workspace,
+                timeout=args.timeout,
+            )
 
         if args.json_output:
             output: dict = {"link": link.to_dict()}
