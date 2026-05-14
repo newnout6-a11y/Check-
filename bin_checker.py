@@ -29,6 +29,7 @@ import re
 import socket
 import ssl
 import sys
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -288,6 +289,13 @@ class CheckResult:
     debit_friendly_signals: list[str] = field(default_factory=list)
     prepaid_block_signals: list[str] = field(default_factory=list)
     known_platform: str = ""
+    # Stripe Checkout deep analysis
+    merchant_name: str = ""
+    merchant_country: str = ""
+    accepted_brands: list[str] = field(default_factory=list)
+    blocked_brands: list[str] = field(default_factory=list)
+    payment_methods: list[str] = field(default_factory=list)
+    card_acceptance: list[str] = field(default_factory=list)
     score: int = 0
     verdict: str = ""
     verdict_detail: str = ""
@@ -342,6 +350,135 @@ def _extract_head_text(body: str) -> str:
         + " "
         + (meta_desc.group(1) if meta_desc else "")
     )
+
+
+def _analyse_stripe_checkout(body: str, result: CheckResult) -> None:
+    """Глубокий анализ Stripe Checkout: merchant, карточные ограничения."""
+    # Имя мерчанта
+    m = re.search(r'business_name:"([^"]+)"', body)
+    if m:
+        result.merchant_name = m.group(1)
+
+    # Страна мерчанта
+    m = re.search(
+        r'merchant_info:\{business_name:"[^"]+",country:"([^"]+)"', body,
+    )
+    if m:
+        result.merchant_country = m.group(1)
+
+    # Определение принимаемых платёжных методов
+    all_brands = {"visa", "mastercard", "amex", "discover", "jcb",
+                  "diners", "unionpay", "elo", "cartes_bancaires"}
+    found_brands: set[str] = set()
+    for brand in all_brands:
+        if re.search(rf'["\']?{brand}["\']?', body, re.IGNORECASE):
+            found_brands.add(brand.upper())
+    if found_brands:
+        result.accepted_brands = sorted(found_brands)
+
+    # Blocked card brands
+    m = re.search(r'brands_blocked', body)
+    if m:
+        ctx = body[m.end():m.end() + 200]
+        for brand in all_brands:
+            if brand in ctx.lower():
+                result.blocked_brands.append(brand.upper())
+
+    # Определение payment methods (Klarna, Link, etc.)
+    pm_names = {
+        "card": "Банковские карты",
+        "klarna": "Klarna (BNPL)",
+        "affirm": "Affirm (BNPL)",
+        "afterpay_clearpay": "Afterpay / Clearpay",
+        "link": "Stripe Link",
+        "cashapp": "Cash App",
+        "apple_pay": "Apple Pay",
+        "google_pay": "Google Pay",
+    }
+    for pm_key, pm_label in pm_names.items():
+        if re.search(
+            rf'["\']?{re.escape(pm_key)}["\']?\s*[:,]', body,
+        ):
+            if pm_label not in result.payment_methods:
+                result.payment_methods.append(pm_label)
+
+    # Card type acceptance analysis
+    body_lower = body.lower()
+
+    # CREDIT/DEBIT/PREPAID handling
+    has_credit = bool(re.search(r'case\s*"CREDIT"', body))
+    has_debit = bool(re.search(r'case\s*"DEBIT"', body))
+    has_prepaid = bool(re.search(r'case\s*"PREPAID"', body))
+
+    if has_credit:
+        result.card_acceptance.append("CREDIT — принимает")
+    if has_debit:
+        result.card_acceptance.append("DEBIT — принимает")
+    if has_prepaid:
+        result.card_acceptance.append("PREPAID — обрабатывает (может блокировать)")
+
+    # Prepaid restrictions
+    prepaid_block_patterns = [
+        r"prepaid\s+cards?\s+(?:are\s+)?not\s+(?:accepted|supported)",
+        r"no\s+prepaid",
+        r"block.*prepaid",
+        r"reject.*prepaid",
+        r"prepaid.*block",
+        r"prepaid.*reject",
+        r"prepaid.*decline",
+    ]
+    for pat in prepaid_block_patterns:
+        if re.search(pat, body_lower):
+            if "PREPAID — ЗАБЛОКИРОВАН" not in result.card_acceptance:
+                result.card_acceptance.append("PREPAID — ЗАБЛОКИРОВАН")
+            break
+
+    # Detect 3DS enforcement
+    if re.search(r'three[_-]?d[_-]?s|3ds2?|threeDS', body):
+        if "3DS обязателен" not in result.card_acceptance:
+            result.card_acceptance.append("3DS обязателен — требуется верификация")
+
+    # Link funding sources
+    m = re.search(r'link_funding_sources:\["([^"]+)"', body)
+    if m:
+        result.card_acceptance.append(
+            f"Link funding: {m.group(1)}")
+
+    # Testmode detection
+    if re.search(r'is_testmode_preview:!0|pk_test_', body):
+        result.card_acceptance.append(
+            "Тестовый режим (pk_test_) — не production")
+    elif re.search(r'pk_live_', body):
+        result.card_acceptance.append("Production-режим (pk_live_)")
+
+
+def _analyse_payment_page(body: str, result: CheckResult) -> None:
+    """Общий анализ платёжной страницы для не-Stripe платформ."""
+    body_lower = body.lower()
+
+    # Detect card brand logos / acceptance info
+    acceptance_patterns = [
+        (r"we\s+accept.*?(?:visa|mastercard|amex)",
+         "Принимает: Visa, Mastercard"),
+        (r"(?:visa|mastercard|amex).*?accepted",
+         "Принимает: основные карточные сети"),
+        (r"debit\s+cards?\s+accepted|accepts?\s+debit",
+         "DEBIT — принимает"),
+        (r"credit\s+cards?\s+accepted|accepts?\s+credit",
+         "CREDIT — принимает"),
+        (r"prepaid\s+cards?\s+(?:are\s+)?not\s+(?:accepted|supported)",
+         "PREPAID — НЕ ПРИНИМАЕТ"),
+        (r"only\s+credit\s+cards?",
+         "Только CREDIT — DEBIT может не пройти"),
+        (r"commercial\s+cards?\s+accepted",
+         "Commercial карты — принимает"),
+        (r"corporate\s+cards?\s+accepted",
+         "Corporate карты — принимает"),
+    ]
+    for pat, label in acceptance_patterns:
+        if re.search(pat, body_lower):
+            if label not in result.card_acceptance:
+                result.card_acceptance.append(label)
 
 
 # ─────────────────────────────────────────────
@@ -402,7 +539,9 @@ def analyse(url: str, *, timeout: float = 20.0,
 
     # ── Payment gateways ──
     for gw, sigs in GATEWAY_SIGNATURES.items():
-        if any(sig.lower() in body_lower for sig in sigs):
+        if gw not in result.gateways and any(
+            sig.lower() in body_lower for sig in sigs
+        ):
             result.gateways.append(gw)
 
     # ── Anti-fraud ──
@@ -511,6 +650,12 @@ def analyse(url: str, *, timeout: float = 20.0,
                         result.threeds_markers.append(sig)
             except Exception:
                 pass
+
+    # ── Deep payment page analysis ──
+    is_stripe_checkout = "checkout.stripe.com" in (hostname or "")
+    if is_stripe_checkout or "Stripe" in result.gateways:
+        _analyse_stripe_checkout(body, result)
+    _analyse_payment_page(body, result)
 
     # ── Scoring ──
     result.score = _compute_score(result)
@@ -696,6 +841,38 @@ def format_report(r: CheckResult) -> str:
         for sig in r.high_risk_signals:
             lines.append(f"    ⚠ {sig}")
 
+    # ── Deep payment analysis ──
+    if r.merchant_name or r.merchant_country:
+        lines.append("")
+        lines.append("  ДАННЫЕ МЕРЧАНТА:")
+        if r.merchant_name:
+            lines.append(f"    Название         : {r.merchant_name}")
+        if r.merchant_country:
+            mc_tier = (" (Tier-1)"
+                       if r.merchant_country in TIER1_COUNTRIES else "")
+            lines.append(
+                f"    Страна           : {r.merchant_country}{mc_tier}")
+
+    if r.accepted_brands:
+        lines.append("")
+        lines.append(
+            f"  ПРИНИМАЕМЫЕ СЕТИ   : {', '.join(r.accepted_brands)}")
+    if r.blocked_brands:
+        lines.append(
+            f"  ЗАБЛОКИРОВАННЫЕ    : {', '.join(r.blocked_brands)}")
+
+    if r.payment_methods:
+        lines.append("")
+        lines.append("  СПОСОБЫ ОПЛАТЫ:")
+        for pm in r.payment_methods:
+            lines.append(f"    ● {pm}")
+
+    if r.card_acceptance:
+        lines.append("")
+        lines.append("  ПРИЁМ КАРТ (детальный анализ):")
+        for ca in r.card_acceptance:
+            lines.append(f"    ● {ca}")
+
     lines.append("")
     lines.append(hr)
     lines.append(f"  СКОР ДОВЕРИЯ       : {r.score} / 100")
@@ -707,7 +884,7 @@ def format_report(r: CheckResult) -> str:
 
 
 # ─────────────────────────────────────────────
-# BIN Lookup (через binlist.net)
+# BIN Lookup (multi-API с автоматическим fallback)
 # ─────────────────────────────────────────────
 
 @dataclass
@@ -721,37 +898,29 @@ class BINInfo:
     country: str = ""
     country_code: str = ""
     prepaid: str = ""
+    source: str = ""
     error: str = ""
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v}
 
 
-def lookup_bin(bin_code: str, *, timeout: float = 10.0) -> BINInfo:
-    """Проверяет BIN через binlist.net (бесплатный API)."""
-    digits = re.sub(r"\D", "", bin_code)[:8]
-    info = BINInfo(bin_code=digits)
-    if len(digits) < 6:
-        info.error = "BIN должен содержать минимум 6 цифр"
-        return info
-
+def _lookup_binlist(digits: str, client: httpx.Client) -> BINInfo | None:
+    """API 1: binlist.net"""
     try:
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.get(
-                f"https://lookup.binlist.net/{digits}",
-                headers={"Accept-Version": "3"},
-            )
-            if resp.status_code == 404:
-                info.error = "BIN не найден в базе"
-                return info
-            if resp.status_code == 429:
-                info.error = "Лимит запросов (попробуйте позже)"
-                return info
-            data = resp.json()
-    except Exception as exc:
-        info.error = f"Ошибка запроса: {exc}"
-        return info
+        resp = client.get(
+            f"https://lookup.binlist.net/{digits}",
+            headers={"Accept-Version": "3"},
+        )
+        if resp.status_code in (429, 403):
+            return None  # rate-limited → fallback
+        if resp.status_code == 404:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
 
+    info = BINInfo(bin_code=digits, source="binlist.net")
     info.scheme = (data.get("scheme") or "").upper()
     info.card_type = (data.get("type") or "").upper()
     info.brand = (data.get("brand") or "").upper()
@@ -764,8 +933,88 @@ def lookup_bin(bin_code: str, *, timeout: float = 10.0) -> BINInfo:
     prepaid_val = data.get("prepaid")
     info.prepaid = ("Да" if prepaid_val
                     else ("Нет" if prepaid_val is False else "Неизвестно"))
-
     return info
+
+
+def _lookup_handyapi(digits: str, client: httpx.Client) -> BINInfo | None:
+    """API 2: data.handyapi.com"""
+    try:
+        resp = client.get(f"https://data.handyapi.com/bin/{digits}")
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if data.get("Status") != "SUCCESS":
+            return None
+    except Exception:
+        return None
+
+    info = BINInfo(bin_code=digits, source="handyapi.com")
+    info.scheme = (data.get("Scheme") or "").upper()
+    info.card_type = (data.get("Type") or "").upper()
+    card_tier = (data.get("CardTier") or "").upper()
+    info.brand = card_tier
+    info.bank_name = data.get("Issuer") or ""
+    country_info = data.get("Country") or {}
+    info.country = country_info.get("Name") or ""
+    info.country_code = (country_info.get("A2") or "").upper()
+    if "PREPAID" in card_tier:
+        info.prepaid = "Да"
+        info.card_type = "DEBIT"
+    else:
+        info.prepaid = "Неизвестно"
+    return info
+
+
+def _lookup_bincodes(digits: str, client: httpx.Client) -> BINInfo | None:
+    """API 3: api.bincodes.com (free tier)"""
+    try:
+        resp = client.get(
+            f"https://api.bincodes.com/bin/?format=json&bin={digits}",
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data.get("bin"):
+            return None
+    except Exception:
+        return None
+
+    info = BINInfo(bin_code=digits, source="bincodes.com")
+    info.scheme = (data.get("card") or "").upper()
+    info.card_type = (data.get("type") or "").upper()
+    info.brand = (data.get("level") or "").upper()
+    info.bank_name = data.get("bank") or ""
+    info.country = data.get("countryname") or ""
+    info.country_code = (data.get("country") or "").upper()
+    info.prepaid = "Неизвестно"
+    return info
+
+
+# Порядок API — от самого информативного к fallback'ам
+_BIN_APIS = [_lookup_binlist, _lookup_handyapi, _lookup_bincodes]
+
+
+def lookup_bin(bin_code: str, *, timeout: float = 10.0) -> BINInfo:
+    """Проверяет BIN через несколько API с автоматическим fallback."""
+    digits = re.sub(r"\D", "", bin_code)[:8]
+    if len(digits) < 6:
+        return BINInfo(
+            bin_code=digits,
+            error="BIN должен содержать минимум 6 цифр",
+        )
+
+    errors: list[str] = []
+    with httpx.Client(timeout=timeout) as client:
+        for api_fn in _BIN_APIS:
+            result = api_fn(digits, client)
+            if result is not None:
+                return result
+            errors.append(api_fn.__doc__ or api_fn.__name__)
+
+    return BINInfo(
+        bin_code=digits,
+        error=f"BIN не найден. Опрошены: {', '.join(errors)}",
+    )
 
 
 def format_bin_report(b: BINInfo) -> str:
@@ -780,6 +1029,8 @@ def format_bin_report(b: BINInfo) -> str:
         lines.append(hr)
         return "\n".join(lines)
 
+    if b.source:
+        lines.append(f"  Источник           : {b.source}")
     lines.append(f"  Платёжная сеть     : {b.scheme}")
     lines.append(f"  Тип карты          : {b.card_type}")
     if b.brand:
@@ -820,6 +1071,51 @@ def format_bin_report(b: BINInfo) -> str:
 # CLI
 # ─────────────────────────────────────────────
 
+def _is_bin(s: str) -> bool:
+    """Проверяет, является ли строка BIN-номером (6-8 чистых цифр)."""
+    digits = re.sub(r"\D", "", s)
+    return digits == s and 6 <= len(digits) <= 8
+
+
+def _extract_bin_from_card(s: str) -> str:
+    """Извлекает BIN (первые 6 цифр) из полного номера карты или строки
+    формата PAN|MM|YYYY|CVV."""
+    parts = s.split("|")
+    pan = re.sub(r"\D", "", parts[0])
+    return pan[:6] if len(pan) >= 6 else ""
+
+
+def _run_batch(card_lines: list[str], args: argparse.Namespace) -> None:
+    """Batch-проверка списка карт с дедупликацией по BIN."""
+    seen_bins: dict[str, BINInfo] = {}
+    results: list[dict] = []
+    lookup_count = 0
+
+    for line in card_lines:
+        b = _extract_bin_from_card(line)
+        if not b:
+            continue
+        if b not in seen_bins:
+            if lookup_count > 0:
+                time.sleep(1.5)  # rate-limit cooldown
+            seen_bins[b] = lookup_bin(b, timeout=args.timeout)
+            lookup_count += 1
+        info = seen_bins[b]
+        results.append({
+            "card": line.split("|")[0],
+            "bin": b,
+            **info.to_dict(),
+        })
+
+    if args.json_output:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    else:
+        print(f"\nПроверено карт: {len(results)}")
+        print(f"Уникальных BIN: {len(seen_bins)}\n")
+        for b, info in seen_bins.items():
+            print(format_bin_report(info))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -828,7 +1124,7 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "target",
+        "target", nargs="?", default=None,
         help="URL сайта или BIN-номер (6-8 цифр) для проверки",
     )
     parser.add_argument(
@@ -843,29 +1139,76 @@ def main() -> None:
         "--no-follow", action="store_true",
         help="Не переходить по внутренним ссылкам checkout/payment",
     )
+    parser.add_argument(
+        "--batch", type=str, default=None,
+        help="Файл со списком карт (PAN|MM|YYYY|CVV) — batch-проверка BIN",
+    )
     args = parser.parse_args()
 
+    # ── Batch-режим: файл с картами ──
+    if args.batch:
+        try:
+            with open(args.batch) as f:
+                card_lines = [
+                    ln.strip() for ln in f if ln.strip()
+                ]
+        except FileNotFoundError:
+            print(f"Файл не найден: {args.batch}", file=sys.stderr)
+            sys.exit(1)
+
+        _run_batch(card_lines, args)
+        sys.exit(0)
+
+    # ── Stdin batch: читаем из stdin если нет target ──
+    if args.target is None:
+        card_lines = []
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                card_lines.append(line)
+
+        if not card_lines:
+            print("Укажите URL, BIN или передайте карты через stdin",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        _run_batch(card_lines, args)
+        sys.exit(0)
+
     target = args.target.strip()
-    digits_only = re.sub(r"\D", "", target)
+
+    # Если передали полный номер карты (16 цифр) или PAN|MM|YYYY|CVV
+    if "|" in target or (re.sub(r"\D", "", target) == target
+                         and len(target) > 8):
+        b = _extract_bin_from_card(target)
+        if b:
+            info = lookup_bin(b, timeout=args.timeout)
+            if args.json_output:
+                print(json.dumps(info.to_dict(),
+                                 ensure_ascii=False, indent=2))
+            else:
+                print(format_bin_report(info))
+            sys.exit(0 if not info.error else 1)
 
     # Если передали чистые цифры (6-8) — это BIN lookup
-    if digits_only == target and 6 <= len(digits_only) <= 8:
+    if _is_bin(target):
         info = lookup_bin(target, timeout=args.timeout)
         if args.json_output:
             print(json.dumps(info.to_dict(), ensure_ascii=False, indent=2))
         else:
             print(format_bin_report(info))
         sys.exit(0 if not info.error else 1)
+
+    # Иначе — анализ URL
+    result = analyse(
+        target, timeout=args.timeout,
+        follow_links=not args.no_follow,
+    )
+    if args.json_output:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     else:
-        result = analyse(
-            target, timeout=args.timeout,
-            follow_links=not args.no_follow,
-        )
-        if args.json_output:
-            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
-        else:
-            print(format_report(result))
-        sys.exit(0 if result.reachable else 1)
+        print(format_report(result))
+    sys.exit(0 if result.reachable else 1)
 
 
 if __name__ == "__main__":
