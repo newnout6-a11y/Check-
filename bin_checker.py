@@ -292,10 +292,13 @@ class CheckResult:
     # Stripe Checkout deep analysis
     merchant_name: str = ""
     merchant_country: str = ""
+    currency: str = ""
     accepted_brands: list[str] = field(default_factory=list)
     blocked_brands: list[str] = field(default_factory=list)
     payment_methods: list[str] = field(default_factory=list)
     card_acceptance: list[str] = field(default_factory=list)
+    prepaid_blocked: bool = False
+    requires_3ds: bool = False
     score: int = 0
     verdict: str = ""
     verdict_detail: str = ""
@@ -429,14 +432,23 @@ def _analyse_stripe_checkout(body: str, result: CheckResult) -> None:
     ]
     for pat in prepaid_block_patterns:
         if re.search(pat, body_lower):
+            result.prepaid_blocked = True
             if "PREPAID — ЗАБЛОКИРОВАН" not in result.card_acceptance:
                 result.card_acceptance.append("PREPAID — ЗАБЛОКИРОВАН")
             break
+    if result.prepaid_block_signals:
+        result.prepaid_blocked = True
 
     # Detect 3DS enforcement
     if re.search(r'three[_-]?d[_-]?s|3ds2?|threeDS', body):
+        result.requires_3ds = True
         if "3DS обязателен" not in result.card_acceptance:
             result.card_acceptance.append("3DS обязателен — требуется верификация")
+
+    # Currency detection
+    m_curr = re.search(r'currency:"([a-z]{3})"', body)
+    if m_curr:
+        result.currency = m_curr.group(1).upper()
 
     # Link funding sources
     m = re.search(r'link_funding_sources:\["([^"]+)"', body)
@@ -1116,6 +1128,376 @@ def _run_batch(card_lines: list[str], args: argparse.Namespace) -> None:
             print(format_bin_report(info))
 
 
+# ─────────────────────────────────────────────
+# Mapping сетей: нормализация
+# ─────────────────────────────────────────────
+_NETWORK_ALIASES: dict[str, str] = {
+    "VISA": "VISA",
+    "MASTERCARD": "MASTERCARD",
+    "AMEX": "AMEX",
+    "AMERICAN EXPRESS": "AMEX",
+    "DISCOVER": "DISCOVER",
+    "JCB": "JCB",
+    "DINERS": "DINERS",
+    "DINERS CLUB": "DINERS",
+    "UNIONPAY": "UNIONPAY",
+    "CHINA UNIONPAY": "UNIONPAY",
+    "ELO": "ELO",
+    "CARTES_BANCAIRES": "CARTES_BANCAIRES",
+}
+
+# Страны с высоким риском отклонения
+HIGH_RISK_COUNTRIES = {
+    "RU", "BY", "IR", "KP", "SY", "CU", "VE", "MM", "SD", "SO",
+    "AF", "IQ", "LB", "LY", "YE", "ZW", "NG",
+}
+
+
+@dataclass
+class CardMatch:
+    """Результат сопоставления карты с платёжной страницей."""
+    card_line: str
+    bin_code: str
+    bin_info: BINInfo
+    fit_score: int = 0          # 0-100, насколько карта подходит
+    verdict: str = ""
+    reasons_good: list[str] = field(default_factory=list)
+    reasons_bad: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "card": self.card_line.split("|")[0],
+            "bin": self.bin_code,
+            "fit_score": self.fit_score,
+            "verdict": self.verdict,
+            "reasons_good": self.reasons_good,
+            "reasons_bad": self.reasons_bad,
+            **self.bin_info.to_dict(),
+        }
+
+
+def _score_card_for_site(
+    bin_info: BINInfo,
+    site: CheckResult,
+) -> tuple[int, list[str], list[str]]:
+    """Оценивает совместимость карты с платёжной страницей.
+
+    Returns (fit_score, reasons_good, reasons_bad).
+    """
+    score = 50  # базовый
+    good: list[str] = []
+    bad: list[str] = []
+
+    # 1. Карточная сеть
+    network = _NETWORK_ALIASES.get(bin_info.scheme, bin_info.scheme)
+    if site.accepted_brands:
+        accepted_norm = {
+            _NETWORK_ALIASES.get(b, b) for b in site.accepted_brands
+        }
+        if network in accepted_norm:
+            score += 15
+            good.append(f"Сеть {network} принимается")
+        else:
+            score -= 40
+            bad.append(
+                f"Сеть {network} НЕ в списке принимаемых "
+                f"({', '.join(sorted(accepted_norm))})")
+    elif network in ("VISA", "MASTERCARD"):
+        score += 10
+        good.append(f"Сеть {network} — универсально принимается")
+
+    if site.blocked_brands:
+        blocked_norm = {
+            _NETWORK_ALIASES.get(b, b) for b in site.blocked_brands
+        }
+        if network in blocked_norm:
+            score -= 50
+            bad.append(f"Сеть {network} ЗАБЛОКИРОВАНА мерчантом")
+
+    # 2. Тип карты (CREDIT / DEBIT / PREPAID)
+    card_type = bin_info.card_type.upper()
+    is_prepaid = bin_info.prepaid == "Да"
+
+    if is_prepaid and site.prepaid_blocked:
+        score -= 50
+        bad.append("PREPAID заблокирован на этом сайте")
+    elif is_prepaid:
+        score -= 15
+        bad.append("PREPAID — повышенный риск отклонения")
+
+    if card_type == "DEBIT" and not is_prepaid:
+        if site.debit_friendly_signals:
+            score += 15
+            good.append("DEBIT — сайт явно поддерживает дебетовые")
+        else:
+            score += 5
+            good.append("DEBIT — стандартный приём")
+
+    if card_type == "CREDIT":
+        score += 10
+        good.append("CREDIT — максимальный приём у всех шлюзов")
+
+    # 3. Страна карты
+    cc = bin_info.country_code
+    if cc in TIER1_COUNTRIES:
+        score += 15
+        good.append(f"Страна {cc} — Tier-1 (низкий риск)")
+    elif cc in HIGH_RISK_COUNTRIES:
+        score -= 30
+        bad.append(f"Страна {cc} — высокий риск блокировки")
+    elif cc:
+        score += 0
+        bad.append(f"Страна {cc} — не Tier-1, возможны ограничения")
+
+    # 4. Совпадение гео карты и мерчанта
+    if site.merchant_country and cc:
+        if cc == site.merchant_country:
+            score += 10
+            good.append(
+                f"Страна карты совпадает с мерчантом ({cc})")
+        elif cc in TIER1_COUNTRIES and site.merchant_country in TIER1_COUNTRIES:
+            score += 5
+            good.append("Обе стороны Tier-1 — кросс-гео ОК")
+
+    # 5. 3DS
+    if site.requires_3ds:
+        if cc in TIER1_COUNTRIES:
+            good.append("3DS обязателен — Tier-1 карта пройдёт")
+        else:
+            score -= 5
+            bad.append("3DS обязателен — карта из не-Tier-1 страны")
+
+    # 6. Шлюз
+    trusted_gw = {"Stripe", "Braintree", "Adyen", "Square",
+                  "Checkout.com", "WorldPay", "PayPal"}
+    if any(gw in trusted_gw for gw in site.gateways):
+        score += 5
+        good.append("Надёжный шлюз — минимальные ложные блокировки")
+
+    # 7. Антифрод
+    if site.antifraud:
+        if is_prepaid or cc in HIGH_RISK_COUNTRIES:
+            score -= 10
+            bad.append(
+                f"Антифрод ({', '.join(site.antifraud)}) "
+                "может отклонить данную карту")
+
+    # Clamp
+    score = max(0, min(100, score))
+    return score, good, bad
+
+
+def match_cards(
+    url: str,
+    card_lines: list[str],
+    *,
+    timeout: float = 20.0,
+) -> tuple[CheckResult, list[CardMatch]]:
+    """Анализирует URL и сопоставляет каждую карту.
+
+    Returns (site_result, sorted_matches) — от лучшей к худшей.
+    """
+    site = analyse(url, timeout=timeout)
+
+    seen_bins: dict[str, BINInfo] = {}
+    matches: list[CardMatch] = []
+    lookup_count = 0
+
+    for line in card_lines:
+        b = _extract_bin_from_card(line)
+        if not b:
+            continue
+        if b not in seen_bins:
+            if lookup_count > 0:
+                time.sleep(1.5)
+            seen_bins[b] = lookup_bin(b, timeout=timeout)
+            lookup_count += 1
+        bi = seen_bins[b]
+        fit, good, bad = _score_card_for_site(bi, site)
+
+        if fit >= 75:
+            verdict = "ОТЛИЧНО ПОДХОДИТ"
+        elif fit >= 55:
+            verdict = "ПОДХОДИТ"
+        elif fit >= 35:
+            verdict = "УСЛОВНО"
+        else:
+            verdict = "НЕ ПОДХОДИТ"
+
+        matches.append(CardMatch(
+            card_line=line,
+            bin_code=b,
+            bin_info=bi,
+            fit_score=fit,
+            verdict=verdict,
+            reasons_good=good,
+            reasons_bad=bad,
+        ))
+
+    matches.sort(key=lambda m: m.fit_score, reverse=True)
+    return site, matches
+
+
+def format_match_report(
+    site: CheckResult,
+    matches: list[CardMatch],
+) -> str:
+    """Человекочитаемый отчёт сопоставления."""
+    lines: list[str] = []
+    hr = "═" * 60
+
+    lines.append(hr)
+    lines.append("  АВТОПОДБОР КАРТ ДЛЯ ПЛАТЁЖНОЙ СТРАНИЦЫ")
+    lines.append(hr)
+    lines.append(f"  URL: {site.url}")
+    if site.merchant_name:
+        lines.append(f"  Мерчант: {site.merchant_name}")
+    if site.merchant_country:
+        mc_tier = " (Tier-1)" if site.merchant_country in TIER1_COUNTRIES else ""
+        lines.append(f"  Страна мерчанта: {site.merchant_country}{mc_tier}")
+    if site.currency:
+        lines.append(f"  Валюта: {site.currency}")
+    if site.gateways:
+        lines.append(f"  Шлюз: {', '.join(site.gateways)}")
+
+    # Site restrictions summary
+    lines.append("")
+    lines.append("  ОГРАНИЧЕНИЯ САЙТА:")
+    if site.accepted_brands:
+        lines.append(
+            f"    Принимает сети: {', '.join(site.accepted_brands)}")
+    if site.blocked_brands:
+        lines.append(
+            f"    Блокирует: {', '.join(site.blocked_brands)}")
+    if site.prepaid_blocked:
+        lines.append("    Prepaid: ЗАБЛОКИРОВАН")
+    else:
+        lines.append("    Prepaid: не заблокирован (или неизвестно)")
+    if site.requires_3ds:
+        lines.append("    3DS: обязателен")
+    if site.antifraud:
+        lines.append(f"    Антифрод: {', '.join(site.antifraud)}")
+
+    lines.append("")
+    lines.append(hr)
+
+    if not matches:
+        lines.append("  Подходящих карт не найдено.")
+        lines.append(hr)
+        return "\n".join(lines)
+
+    # Group by verdict
+    best = [m for m in matches if m.fit_score >= 75]
+    ok = [m for m in matches if 55 <= m.fit_score < 75]
+    maybe = [m for m in matches if 35 <= m.fit_score < 55]
+    bad = [m for m in matches if m.fit_score < 35]
+
+    # Show unique BINs with best cards
+    seen_display: set[str] = set()
+
+    if best:
+        lines.append(f"  ★ ЛУЧШИЕ КАРТЫ ({len(best)} шт):")
+        for m in best:
+            if m.bin_code in seen_display:
+                continue
+            seen_display.add(m.bin_code)
+            pan = m.card_line.split("|")[0]
+            lines.append(
+                f"    {pan}  [{m.fit_score}/100 {m.verdict}]")
+            lines.append(
+                f"      BIN {m.bin_code}: {m.bin_info.scheme} "
+                f"{m.bin_info.card_type} / {m.bin_info.bank_name} "
+                f"/ {m.bin_info.country_code}")
+            if m.reasons_good:
+                for r in m.reasons_good:
+                    lines.append(f"        + {r}")
+            if m.reasons_bad:
+                for r in m.reasons_bad:
+                    lines.append(f"        - {r}")
+        lines.append("")
+
+    if ok:
+        lines.append(f"  ● ПОДХОДЯТ ({len(ok)} шт):")
+        for m in ok:
+            if m.bin_code in seen_display:
+                continue
+            seen_display.add(m.bin_code)
+            pan = m.card_line.split("|")[0]
+            lines.append(
+                f"    {pan}  [{m.fit_score}/100 {m.verdict}]")
+            lines.append(
+                f"      BIN {m.bin_code}: {m.bin_info.scheme} "
+                f"{m.bin_info.card_type} / {m.bin_info.bank_name} "
+                f"/ {m.bin_info.country_code}")
+            if m.reasons_bad:
+                for r in m.reasons_bad:
+                    lines.append(f"        - {r}")
+        lines.append("")
+
+    if maybe:
+        lines.append(f"  ◐ УСЛОВНО ({len(maybe)} шт):")
+        for m in maybe:
+            if m.bin_code in seen_display:
+                continue
+            seen_display.add(m.bin_code)
+            pan = m.card_line.split("|")[0]
+            lines.append(
+                f"    {pan}  [{m.fit_score}/100 {m.verdict}]")
+            lines.append(
+                f"      BIN {m.bin_code}: {m.bin_info.scheme} "
+                f"{m.bin_info.card_type} / {m.bin_info.country_code}")
+            if m.reasons_bad:
+                for r in m.reasons_bad[:2]:
+                    lines.append(f"        - {r}")
+        lines.append("")
+
+    if bad:
+        lines.append(f"  ✕ НЕ ПОДХОДЯТ ({len(bad)} шт):")
+        for m in bad:
+            if m.bin_code in seen_display:
+                continue
+            seen_display.add(m.bin_code)
+            pan = m.card_line.split("|")[0]
+            lines.append(
+                f"    {pan}  [{m.fit_score}/100 {m.verdict}]")
+            lines.append(
+                f"      BIN {m.bin_code}: {m.bin_info.scheme} "
+                f"{m.bin_info.card_type} / {m.bin_info.country_code}")
+            if m.reasons_bad:
+                for r in m.reasons_bad[:2]:
+                    lines.append(f"        - {r}")
+        lines.append("")
+
+    # Summary
+    lines.append(hr)
+    total = len(matches)
+    lines.append(f"  ИТОГО: {total} карт проверено")
+    lines.append(
+        f"    ★ Лучшие: {len(best)}  ● Подходят: {len(ok)}  "
+        f"◐ Условно: {len(maybe)}  ✕ Нет: {len(bad)}")
+    if best:
+        top = best[0]
+        lines.append(
+            f"\n  ➤ РЕКОМЕНДАЦИЯ: {top.card_line.split('|')[0]} "
+            f"(BIN {top.bin_code}, {top.bin_info.scheme} "
+            f"{top.bin_info.card_type}, "
+            f"{top.bin_info.country_code}) — {top.fit_score}/100")
+    elif ok:
+        top = ok[0]
+        lines.append(
+            f"\n  ➤ РЕКОМЕНДАЦИЯ: {top.card_line.split('|')[0]} "
+            f"(BIN {top.bin_code}, {top.bin_info.scheme} "
+            f"{top.bin_info.card_type}, "
+            f"{top.bin_info.country_code}) — {top.fit_score}/100")
+    else:
+        lines.append(
+            "\n  ➤ НЕТ ПОДХОДЯЩИХ КАРТ. Нужна карта "
+            "VISA/MC CREDIT или DEBIT (не prepaid) из Tier-1 страны.")
+    lines.append(hr)
+
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -1143,7 +1525,47 @@ def main() -> None:
         "--batch", type=str, default=None,
         help="Файл со списком карт (PAN|MM|YYYY|CVV) — batch-проверка BIN",
     )
+    parser.add_argument(
+        "--match", type=str, default=None,
+        help=("URL платёжной страницы для автоподбора карт. "
+              "Используется вместе с --batch или stdin."),
+    )
     args = parser.parse_args()
+
+    # ── Match-режим: автоподбор карт ──
+    if args.match:
+        card_lines: list[str] = []
+        if args.batch:
+            try:
+                with open(args.batch) as f:
+                    card_lines = [ln.strip() for ln in f if ln.strip()]
+            except FileNotFoundError:
+                print(f"Файл не найден: {args.batch}", file=sys.stderr)
+                sys.exit(1)
+        elif args.target:
+            card_lines = [args.target]
+        else:
+            for line in sys.stdin:
+                line = line.strip()
+                if line:
+                    card_lines.append(line)
+
+        if not card_lines:
+            print("Укажите карты через --batch, аргумент или stdin",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        site, matches = match_cards(
+            args.match, card_lines, timeout=args.timeout,
+        )
+        if args.json_output:
+            print(json.dumps({
+                "site": site.to_dict(),
+                "matches": [m.to_dict() for m in matches],
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(format_match_report(site, matches))
+        sys.exit(0)
 
     # ── Batch-режим: файл с картами ──
     if args.batch:
