@@ -1106,23 +1106,61 @@ def _wc_check_card(
                 else:
                     print(f"    [WC] Товары не найдены, пробуем checkout без корзины")
 
-                # Шаг 2.5: выбираем shipping rate (пробуем стандартные)
-                shipping_rate_id = ""
-                try:
-                    for rid in ["flat_rate:1", "flat_rate:2", "free_shipping:1", "local_pickup:1"]:
+                # Шаг 2.5: выбираем shipping rate
+                # Сначала пробуем кешированный из gateway, потом парсим из cart, потом гадаем
+                shipping_rate_id = gw.get("shipping_rate", "")
+                if not shipping_rate_id:
+                    # Парсим реальные shipping rates из GET /cart ответа
+                    try:
+                        cart_for_shipping = client.get(f"{gw_url}/wp-json/wc/store/v1/cart",
+                            headers={"User-Agent": UA, "Accept": "application/json",
+                                     **({"Nonce": nonce} if nonce else {})})
+                        if cart_for_shipping.status_code == 200:
+                            cart_json = cart_for_shipping.json()
+                            ship_rates_data = cart_json.get("shipping_rates", [])
+                            if ship_rates_data:
+                                # WC Store API формат: shipping_rates[0].shipping_rates[0].rate_id
+                                inner_rates = ship_rates_data[0].get("shipping_rates", [])
+                                if inner_rates:
+                                    shipping_rate_id = inner_rates[0].get("rate_id", "")
+                                    if shipping_rate_id:
+                                        gw["shipping_rate"] = shipping_rate_id
+                                        print(f"    [WC] Shipping rate из /cart: {shipping_rate_id}")
+                    except Exception:
+                        pass
+
+                if not shipping_rate_id:
+                    # Fallback: пробуем стандартные
+                    try:
+                        for rid in ["flat_rate:1", "flat_rate:2", "free_shipping:1", "local_pickup:1"]:
+                            sel_headers = {"User-Agent": UA, "Content-Type": "application/json", "Accept": "application/json"}
+                            if nonce:
+                                sel_headers["Nonce"] = nonce
+                            sel_resp = client.post(f"{gw_url}/wp-json/wc/store/v1/cart/select-shipping-rate",
+                                json={"rate_id": rid}, headers=sel_headers)
+                            if sel_resp.status_code == 200:
+                                shipping_rate_id = rid
+                                gw["shipping_rate"] = rid
+                                print(f"    [WC] Shipping rate (fallback): {rid}")
+                                break
+                        else:
+                            print(f"    [WC] Shipping rates не найдены")
+                    except Exception as e:
+                        print(f"    [WC] Ошибка shipping: {e}")
+                else:
+                    # Применяем кешированный rate
+                    try:
                         sel_headers = {"User-Agent": UA, "Content-Type": "application/json", "Accept": "application/json"}
                         if nonce:
                             sel_headers["Nonce"] = nonce
                         sel_resp = client.post(f"{gw_url}/wp-json/wc/store/v1/cart/select-shipping-rate",
-                            json={"rate_id": rid}, headers=sel_headers)
-                        if sel_resp.status_code == 200:
-                            shipping_rate_id = rid
-                            print(f"    [WC] Shipping rate найден: {rid}")
-                            break
-                    else:
-                        print(f"    [WC] Стандартные shipping rates не подошли")
-                except Exception as e:
-                    print(f"    [WC] Ошибка получения shipping: {e}")
+                            json={"rate_id": shipping_rate_id}, headers=sel_headers)
+                        new_nonce = sel_resp.headers.get("nonce", "") or sel_resp.headers.get("X-WC-Store-API-Nonce", "")
+                        if new_nonce:
+                            nonce = new_nonce
+                        print(f"    [WC] Shipping rate (cached): {shipping_rate_id} → HTTP {sel_resp.status_code}")
+                    except Exception:
+                        pass
 
                 # Шаг 2.7: обновляем customer (нужно для WC Stripe v9.7+ — billing address)
                 try:

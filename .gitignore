@@ -1,6 +1,25 @@
+# Secrets & keys
+.env
+.env.*
+
+# Gateway pool (contains live pk_live_ keys)
+gateway_pool.json
+
+# Results / artifacts
+batch_results.txt
+*.log
+
+# Python
 __pycache__/
 *.pyc
-.env
-*.png
-*.txt
-!requirements.txt
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
