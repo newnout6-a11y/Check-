@@ -31,9 +31,27 @@ async def run_validate(args: argparse.Namespace) -> int:
     output_fmt = getattr(args, "output", "table")
     concurrency = args.concurrency or config.concurrency.semaphore_size
 
+    # Resolve proxies from --proxy / --proxy-file.
+    from webrecon.cli.proxy import resolve_proxies
+    try:
+        proxies = resolve_proxies(
+            getattr(args, "proxy", ""),
+            getattr(args, "proxy_file", ""),
+        )
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    proxy_arg: str | list[str] | None = None
+    if len(proxies) == 1:
+        proxy_arg = proxies[0]
+    elif proxies:
+        proxy_arg = proxies
+
     # Single Stripe key validation.
     if args.stripe_key:
-        async with MassParserClient(concurrency=1) as http:
+        async with MassParserClient(
+            concurrency=1, proxy=proxy_arg
+        ) as http:
             from webrecon.automation.stripe_tester import StripeTester
             tester = StripeTester(http)
 
@@ -68,7 +86,9 @@ async def run_validate(args: argparse.Namespace) -> int:
 
     results: list[dict[str, Any]] = []
 
-    async with MassParserClient(concurrency=concurrency) as http:
+    async with MassParserClient(
+        concurrency=concurrency, proxy=proxy_arg
+    ) as http:
         from webrecon.automation.validator import WebsiteValidator
         validator = WebsiteValidator(http)
 

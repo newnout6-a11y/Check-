@@ -21,6 +21,10 @@ extend-exclude = [
     "dist",
     "tests/fixtures",
     "tests/webrecon/fixtures",
+    # Legacy standalone scripts -- frozen for reference, not subject
+    # to current style rules. Active scripts (e.g. xray_config_gen.py)
+    # live directly under scripts/ and are linted normally.
+    "scripts/legacy",
 ]
 
 [lint]

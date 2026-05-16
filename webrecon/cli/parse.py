@@ -52,9 +52,27 @@ async def run_parse(args: argparse.Namespace) -> int:
     output_fmt = getattr(args, "output", "table")
     concurrency = args.concurrency or config.concurrency.semaphore_size
 
+    # Resolve proxies from --proxy / --proxy-file.
+    from webrecon.cli.proxy import resolve_proxies
+    try:
+        proxies = resolve_proxies(
+            getattr(args, "proxy", ""),
+            getattr(args, "proxy_file", ""),
+        )
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    proxy_arg: str | list[str] | None = None
+    if len(proxies) == 1:
+        proxy_arg = proxies[0]
+    elif proxies:
+        proxy_arg = proxies
+
     results: list[dict[str, Any]] = []
 
-    async with MassParserClient(concurrency=concurrency) as http:
+    async with MassParserClient(
+        concurrency=concurrency, proxy=proxy_arg
+    ) as http:
         # Exposed file scanning.
         if scan_exposed:
             from webrecon.mass_parser.scanner import ExposedFileScanner

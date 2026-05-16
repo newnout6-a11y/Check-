@@ -119,6 +119,26 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Decrease output verbosity",
     )
+    parser.add_argument(
+        "--proxy",
+        type=str,
+        default="",
+        help=(
+            "Proxy URL for outbound HTTP. "
+            "Examples: socks5://127.0.0.1:10808, http://user:pass@host:8080. "
+            "Multiple proxies can be comma-separated for round-robin."
+        ),
+    )
+    parser.add_argument(
+        "--proxy-file",
+        type=str,
+        default="",
+        help=(
+            "Path to a file with one proxy URL per line. "
+            "Lines starting with '#' are treated as comments. "
+            "Combined with --proxy: both lists are merged."
+        ),
+    )
 
     subparsers = parser.add_subparsers(
         title="commands",
@@ -195,7 +215,7 @@ def _add_discover_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--source",
         type=str,
-        choices=["fofa", "shodan", "serper", "all"],
+        choices=["fofa", "shodan", "serper", "crtsh", "wayback", "all"],
         default="all",
         help="Discovery source(s) to use",
     )
