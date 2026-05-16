@@ -2,6 +2,28 @@
 
 Анализ платёжной инфраструктуры сайтов и проверка BIN-номеров карт.
 
+## Структура репозитория
+
+```text
+chek/
+  binchecker/         # Пакет: BIN lookup, gateway detection, card validation
+  webrecon/           # Пакет: web reconnaissance + automation toolkit
+  tests/              # Тесты для обоих пакетов
+    binchecker/...    # (существующие тесты бинчекера)
+    webrecon/         # тесты нового пакета (unit/integration/property)
+  docs/
+    webrecon/         # Документация для webrecon (getting started, API, deploy)
+  scripts/
+    legacy/           # Оригинальные standalone-скрипты (FOFA scraper и т.д.)
+  scratch/            # Личные рабочие файлы (НЕ в git: PAN-дампы, скриншоты)
+  pyproject.toml      # Один wheel содержит обе утилиты
+  .env.example        # Шаблон конфигурации
+```
+
+- **`binchecker/`** — этот документ описывает именно его. Подробности ниже.
+- **`webrecon/`** — реконсистема: FOFA / Shodan / Serper / GitHub / mass-parser. Полная документация в [`docs/webrecon/`](docs/webrecon/README.md).
+- **`scripts/legacy/`** — исходные скрипты, на основе которых был построен `webrecon`. Сохранены для справки и fallback-запуска без полной конфигурации.
+
 ## Возможности
 
 ### 1. Анализ сайта по URL
@@ -37,22 +59,22 @@ pip install httpx
 
 ```bash
 # Анализ сайта
-python bin_checker.py stripe.com
-python bin_checker.py ads.google.com
-python bin_checker.py shopify.com
+python scripts/legacy/bin_checker.py stripe.com
+python scripts/legacy/bin_checker.py ads.google.com
+python scripts/legacy/bin_checker.py shopify.com
 
 # BIN Lookup
-python bin_checker.py 424631
-python bin_checker.py 459654
+python scripts/legacy/bin_checker.py 424631
+python scripts/legacy/bin_checker.py 459654
 
 # JSON-вывод
-python bin_checker.py stripe.com --json
+python scripts/legacy/bin_checker.py stripe.com --json
 
 # Без перехода по checkout-ссылкам
-python bin_checker.py example.com --no-follow
+python scripts/legacy/bin_checker.py example.com --no-follow
 
 # Кастомный таймаут
-python bin_checker.py example.com --timeout 30
+python scripts/legacy/bin_checker.py example.com --timeout 30
 ```
 
 ## Пример вывода
@@ -91,12 +113,12 @@ python bin_checker.py example.com --timeout 30
 #### ChatGPT Team
 ```bash
 # Генерация ссылки с промокодом для GB/GBP
-python bin_checker.py --generate chatgpt \
+python scripts/legacy/bin_checker.py --generate chatgpt \
   --token <accessToken> \
   --country GB --promo codestonegb
 
 # С автоподбором карт
-python bin_checker.py --generate chatgpt \
+python scripts/legacy/bin_checker.py --generate chatgpt \
   --token <accessToken> \
   --country GB --batch cards.txt
 ```
@@ -104,17 +126,17 @@ python bin_checker.py --generate chatgpt \
 #### SuperGrok (Grok / xAI)
 ```bash
 # Генерация ссылки SuperGrok
-python bin_checker.py --generate grok \
+python scripts/legacy/bin_checker.py --generate grok \
   --token <sso_cookie> \
   --plan supergrok --interval month
 
 # SuperGrok Lite
-python bin_checker.py --generate grok \
+python scripts/legacy/bin_checker.py --generate grok \
   --token <sso_cookie> \
   --plan supergrok_lite
 
 # JS-скрипт для консоли браузера (альтернатива)
-python bin_checker.py --generate grok --script
+python scripts/legacy/bin_checker.py --generate grok --script
 ```
 
 **Как получить токен:**

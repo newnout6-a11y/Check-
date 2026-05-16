@@ -1,0 +1,91 @@
+# Ruff configuration for the `binchecker` and `webrecon` packages.
+#
+# Kept in a standalone `ruff.toml` (rather than `[tool.ruff]` in
+# `pyproject.toml`) so that tasks 1.1 (which authors `pyproject.toml`)
+# and 1.3 (this file) can be implemented in parallel without stomping
+# on the same file.
+#
+# Scope: every Python source file in the workspace under `binchecker/`,
+# `webrecon/`, and `tests/`. Per-file ignores below relax the rules
+# that don't make sense in test code.
+
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".cache",
+    ".hypothesis",
+    "build",
+    "dist",
+    "tests/fixtures",
+    "tests/webrecon/fixtures",
+]
+
+[lint]
+# Strict-but-pragmatic rule families. Each entry below is intentional;
+# please leave a justification when adding or removing one.
+#
+#   E   - pycodestyle errors
+#   W   - pycodestyle warnings (whitespace, deprecated syntax)
+#   F   - pyflakes (unused imports, undefined names, …)
+#   I   - isort (import ordering / grouping)
+#   N   - pep8-naming (consistent class / function / constant names)
+#   UP  - pyupgrade (modernise idioms to the target Python version)
+#   B   - flake8-bugbear (likely-bug constructs)
+#   A   - flake8-builtins (don't shadow builtins)
+#   C4  - flake8-comprehensions (cleaner comprehensions / generator exprs)
+#   SIM - flake8-simplify (collapsible if/else, redundant boolean ops)
+#   RET - flake8-return (explicit return cleanups)
+#   TCH - flake8-type-checking (move type-only imports under TYPE_CHECKING)
+#   RUF - ruff-specific lints (e.g. RUF100 unused noqa, RUF013 implicit Optional)
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "N",
+    "UP",
+    "B",
+    "A",
+    "C4",
+    "SIM",
+    "RET",
+    "TCH",
+    "RUF",
+]
+
+# Project-wide rule-level ignores:
+#   E501 — line-length is enforced by the formatter; raising it here
+#          for source files prevents spurious failures on long URLs in
+#          comments or generated docstrings while still keeping the
+#          formatter's hard cap at 100.
+ignore = []
+
+[lint.per-file-ignores]
+# Tests are allowed to:
+#   * have long descriptive lines (E501) — property docstrings and large
+#     generated example payloads frequently exceed 100 cols on purpose;
+#   * shadow builtins (A001/A002/A003) — fixture parameters routinely
+#     mirror `id`, `type`, `format`, etc. for readability;
+#   * use plain `assert` patterns and skip naming purity (N802 / N806)
+#     for parametrised helpers;
+#   * keep module-level imports outside TYPE_CHECKING (TCH) — tests
+#     execute their imports for real.
+"tests/**/*.py" = ["E501", "A001", "A002", "A003", "N802", "N806", "TCH001", "TCH002", "TCH003"]
+# The `__init__.py` files in the package skeleton intentionally re-export
+# names; relax F401 (unused import) there.
+"**/__init__.py" = ["F401"]
+
+[lint.isort]
+# Group first-party packages so `binchecker` and `webrecon` imports
+# always sort into their own block, separate from third-party libs.
+known-first-party = ["binchecker", "webrecon", "tests"]
+combine-as-imports = true
+
+[format]
+# Use ruff's default formatter settings (PEP 8 compatible).
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

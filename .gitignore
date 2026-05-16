@@ -1,6 +1,44 @@
+## Python build artefacts
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+build/
+dist/
+*.egg-info/
+
+## Virtual environments
+.venv/
+venv/
+env/
+
+## Tooling caches
+.coverage
+coverage.xml
+.coverage_html/
+.hypothesis/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+## Editor / IDE
+.vscode/
+.idea/
+
+## Secrets and runtime artefacts (never commit)
 .env
+gateway_pool.json
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+## Scratch / personal working files
+scratch/
+
+## Binary content that should not live in the repo
 *.png
+!docs/**/*.png
 *.txt
 !requirements.txt
+!**/CHANGELOG.txt
