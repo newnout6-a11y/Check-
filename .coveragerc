@@ -1,0 +1,49 @@
+# Coverage.py configuration for the `binchecker` and `webrecon` packages.
+#
+# The `--cov=...` flags in `pytest.ini` enumerate the *critical* sources
+# that count toward the 80% gate (Requirement 11.5). This file fine-tunes
+# how coverage data is collected and reported for those sources.
+
+[run]
+branch = True
+parallel = False
+source =
+    binchecker/core
+    binchecker/pipeline
+    binchecker/lookup/chain.py
+    binchecker/log/pan_filter.py
+    binchecker/config/loader.py
+    webrecon
+
+omit =
+    */__init__.py
+    */tests/*
+    tests/*
+    webrecon/version.py
+
+[report]
+# Fail the report (and therefore the run, via pytest-cov's
+# `--cov-fail-under=80`) if combined coverage drops below the gate.
+fail_under = 80
+precision = 2
+show_missing = True
+skip_covered = False
+sort = -Cover
+
+# Pragmas / patterns that should not count against coverage. `# pragma:
+# no cover` is the standard escape hatch; the rest are conventional
+# "this is impossible to hit in normal runtime" markers.
+exclude_lines =
+    pragma: no cover
+    raise NotImplementedError
+    if TYPE_CHECKING:
+    if __name__ == .__main__.:
+    \.\.\.$
+    @overload
+    @abstractmethod
+
+[html]
+directory = .coverage_html
+
+[xml]
+output = coverage.xml
